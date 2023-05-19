@@ -1,0 +1,191 @@
+---
+title: "NSC_Analysis"
+author: "R. Alex Thompson"
+date: "5/19/2023"
+output: html_document
+---
+
+
+First we want to load all of the packages that are necessary
+``` {r setup}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+```
+
+
+Now, let's work on the standard curves and make sure those look right
+``` {r curves}
+
+# load in the data
+nsc_standard<-read.csv("DATA LOCATION HERE")%>% 
+  drop_na()
+#---------------- BUILD SUGAR GFG CURVE ------------#
+gfg<-nsc_standard%>%
+  filter(Run==1)%>% # Specify the run we want to look at in the event that we rerun the standard
+  filter(Wavelength=="A490")%>% # sugar wavelength
+  dplyr::rename(A490 = Value)%>%
+  dplyr::select(-Wavelength)%>%
+  dplyr::group_by(Run,Sample,Tissue,Date)%>%
+  dplyr::mutate(A490=mean(A490))
+
+gfgDI <- gfg %>% filter(grepl('_DI', Sample)) # make a new df with only the no-phenol samples
+gfgDI$Sample <- gsub("_DI", "", gfgDI$Sample) # rename no phenol samples to match original samples
+gfgDI <- gfgDI %>% 
+  dplyr::rename(A490_ = A490) %>% # make new column name for the no phenol samples
+  ungroup %>%
+  dplyr::select(Date,Spec.Rep,Sample,Tissue,Run,A490_)
+gfg <- merge(gfg, gfgDI) %>% # combine no phenol samples with original samples
+  distinct()
+gfg$Sample<-as.numeric(gfg$Sample) # make sure sample name is numeric, so plotted in order
+
+
+gfg_lm<-lm(A490~Sample,data=gfg)
+gfg_slope<-summary(gfg_lm)$coefficients[2,1]
+gfg_int<-summary(gfg_lm)$coefficients[1,1]
+gfg_blanklm<-lm(A490_~Sample,data=gfg)
+gfgb_slope<-summary(gfg_blanklm)$coefficients[2,1]
+gfgb_int<-summary(gfg_blanklm)$coefficients[1,1]
+gfg_plot<-ggplot(gfg,aes(Sample,A490)) + geom_point() + geom_smooth(method="lm") # plot it to check linearity / recovery
+gfgb_plot<-ggplot(gfg,aes(Sample,A490_)) + geom_point() + geom_smooth(method="lm")
+
+#------------------------------------- BUILD GLUC STANDARD CURVE ---------------------------------#
+gluc<-nsc_standard%>%
+  dplyr::filter(Run==1)%>%
+  dplyr::filter(Wavelength=="A525")%>%
+  dplyr::rename(A525 = Value)%>%
+  dplyr::select(-Wavelength)%>%
+  dplyr::group_by(Sample)%>%
+  dplyr::mutate(A525=mean(A525))%>%
+  distinct()
+gluc$Sample<-as.numeric(gluc$Sample) # make sure sample name is numeric, so plotted in order
+
+gluc_plot<-ggplot(gluc,aes(Sample,A525)) + geom_point() + geom_smooth(method="lm") # plot it to check linearity / recovery
+gluc_lm<-lm(A525~Sample,data=gluc)
+gluc_slope<-summary(gluc_lm)$coefficients[2,1]
+
+```
+
+
+Once we can confirm linearity in our standard we can run the analysis
+``` {r sugar analysis}
+############ SUGAR #############
+pct_sugar <- sugar %>% 
+  #dplyr::filter(Run>=42)%>% # only use this code if you want to isolate a specific run for evaluation
+  dplyr::select(Run,Date,Tissue,Spec.Rep,Sample,Value,Weight)%>%
+  dplyr::rename(A490 = Value)%>% # rename the Value column to reflect the wavelength of the spec
+  group_by(Run,Tissue,Date,Sample)%>%
+  dplyr::mutate(pd=abs(log(A490)-log(mean(A490))))
+
+ps<-pct_sugar%>%
+  filter(Sample=="PS")%>%
+  group_by(Run)%>%
+  mutate(mean=mean(A490))
+
+re_run<-pct_sugar%>%
+  dplyr::filter(abs(pd)>0.15)%>%
+  count(Sample,Tissue,Run,Date)%>%
+  dplyr::mutate(rerun=ifelse(n==3,1,0))%>%
+  filter(rerun==1)
+
+pct_sugar<-pct_sugar%>%
+  #dplyr::filter(abs(pd)<=0.15)%>%
+  dplyr::group_by(Run,Sample,Tissue,Date)%>%
+  dplyr::mutate(A490=mean(A490))
+#----------------------------------#
+# this code filters that dataset and excludes samples that were re-processed
+# can we make it more efficient?
+#std<-pct_sugar%>%
+ # filter(Sample=="Clear" | Sample=="PS")
+#keep<-pct_sugar%>%
+ # filter(drop=="keep")
+#drop<-pct_sugar%>%
+ # filter(drop=="drop")%>%
+ #dplyr::group_by(Sample,Tissue,Date)%>%
+  #filter(Run==max(Run))
+#pct_sugar1<-rbind(keep,drop,std)
+#-------------------------------#
+pct_sugarDI <- pct_sugar %>% filter(grepl('_DI', Sample)) # make a new df with only the no-phenol samples
+pct_sugarDI$Sample <- gsub("_DI", "", pct_sugarDI$Sample) # rename no phenol samples to match original samples
+pct_sugarDI <- pct_sugarDI %>% 
+  dplyr::rename(A490_ = A490) %>% # make new column name for the no phenol samples
+  dplyr::ungroup() %>%
+  dplyr::select(Date,Spec.Rep,Sample,Tissue,Run,A490_) # only select necessary columns
+pct_sugar <- merge(pct_sugar, pct_sugarDI)%>%  # combine no phenol samples with original samples
+  distinct() 
+
+
+# transform A490 data to concentrations
+pct_sugar_corrected <- pct_sugar %>% # combine sugar df with sample info df
+  dplyr::select(Date, Spec.Rep, Tissue, Run, Sample, A490, A490_, Weight) %>% # only select necessary columns
+  dplyr::mutate(difference=((A490-gfg_int)-(A490_-gfgb_int)))%>%
+  dplyr::mutate(conc=(difference/(gfg_slope-gfgb_slope)))%>%
+  dplyr::mutate(corr_conc=(conc*10))%>%
+  dplyr::mutate(pct=(corr_conc*2.67/Weight/1000000)*100)
+
+# create a cleaned up version of the dataset, to save to the master file
+sugar_final<-pct_sugar_corrected%>%
+  dplyr::select(Date,Tissue,Sample,pct)%>%
+  distinct()%>%
+  dplyr::rename("Concentration"=pct)%>%
+  dplyr::rename("ID"=Sample)%>%
+  dplyr::mutate(Component="Sugar")
+sugar_final<-merge(sugar_final,treatments)%>%distinct()
+sugar_final$Treatment<-as.factor(sugar_final$Treatment)
+
+
+```
+
+
+
+Now run the starch samples
+``` {r Starch}
+
+######## STARCH ###########
+starch2 <- starch %>% 
+  filter(Run>=45)%>%
+  dplyr::rename(A525 = Value) %>% # rename the Value column to reflect the wavelength of the spec
+  dplyr::group_by(Run,Sample,Tissue,Date)%>%
+  dplyr::mutate(A525=mean(A525))%>%
+  group_by(Sample,Tissue,Date)%>%
+  mutate(drop=ifelse(n_distinct(Run)>1,"drop","keep")) # identify samples that were reprocessed
+
+std<-starch2%>%
+  filter(Sample=="200G" | Sample=="C" | Sample=="PS") # pull out standards for later analysis
+keep<-starch2%>%
+  filter(drop=="keep") # filter only samples that were not reprocessed
+drop<-starch2%>%
+  filter(drop=="drop")%>% # select reprocessed samples
+  group_by(Sample,Tissue,Date)%>%
+  filter(Run==max(Run)) # of samples processed again, only use the latest run in the analysis
+starch2<-rbind(keep,drop,std) # combine all, carry on
+
+pct_starch<- starch2%>%
+  dplyr::select(Date, Spec.Rep, Tissue, Run, Sample, A525, Weight)%>%
+  mutate(pct=((((A525)/gluc_slope*10)*0.7)/(Weight*1000000)*0.9)*100)%>%
+  filter(Sample!="200G")%>%
+  filter(Sample!="C")
+
+
+starch_final<-pct_starch%>%
+  ungroup()%>%
+  dplyr::select(Date,Tissue,Sample,pct)%>%
+  distinct()%>%
+  dplyr::rename(Concentration=pct)%>%
+  mutate(Component="Starch")%>%
+  filter(Sample!="100G")%>%
+  dplyr::rename(ID=Sample)%>%
+  mutate(Concentration=ifelse(Concentration<0,0,Concentration))
+starch_final<-merge(starch_final,treatments)
+
+
+```
+
+``` {r Save Data}
+NSC<-read.csv("/Users/alexthompson/Dropbox/PhD data/Sevilleta Data/nsc_master.csv")
+NSC<-rbind(NSC,sugar_final)%>% # use this to merge sugar and NSC
+  distinct()
+NSC<-rbind(NSC,starch_final)%>% # merge with starch
+  distinct()
+write.csv(NSC,"nsc_master.csv")
+```
